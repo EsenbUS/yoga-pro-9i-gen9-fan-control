@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# Config (user-specific)
+fan_config.json
+
+# Dev files (not part of the app)
+*.png
+The_full_DSDT_file.txt
+Device_(EC0).txt
+relevant_section.txt
+
+# Temporary
+*.ico
