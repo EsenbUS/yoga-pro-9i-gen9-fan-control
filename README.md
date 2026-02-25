@@ -1,12 +1,16 @@
 > **Project uses WinRing0, so you are required to exclude it from Windows Defender/whatever antivirus you use if you want to use this program. 
 See [Microsoft Article](https://support.microsoft.com/en-us/windows/microsoft-defender-antivirus-alert-vulnerabledriver-winnt-winring0-eb057830-d77b-41a2-9a34-015a5d203c42)**
 
-> Additionally, for safety's sake before using this program update BIOS to the latest (NKCN32WW) using this website [Lenovo Drivers](https://pcsupport.lenovo.com/us/en/products/laptops-and-netbooks/yoga-series/yoga-pro-9-16imh9/83dn/83dn0008us/pf4zs51d/downloads/driver-list)
+> **Although the program uses WinRing0, here it is implemented as a temporary driver: it installs the driver, uses it, and then uninstalls its service immediately after every read. This way 99.97% of the time driver is not available to any malicious software. The remaining ~0.03% of the time (50ms window every 1.5s during monitoring; only when the program is in the foreground): a race condition is theoretically possible - a malicious process polling for the device could catch the window and open a handle before deletion. In practice this race window is so narrow and so unpredictable that realistic exploitation is essentially impossible - an attacker would need to win a 50ms race against an unpredictable timer with no scheduling guarantees.**
+
+> For safety's sake before using this program update BIOS to the latest (NKCN32WW) using this website [Lenovo Drivers](https://pcsupport.lenovo.com/us/en/products/laptops-and-netbooks/yoga-series/yoga-pro-9-16imh9/83dn/83dn0008us/pf4zs51d/downloads/driver-list)
+
+
 
 # Fan Control - Lenovo Yoga Pro 9i Gen 9
 
 <p align="center">
-  <img src="https://cdn.imgchest.com/files/b6bbc12244b4.png" alt="Yoga Fan Control GUI" width="600">
+  <img src="https://cdn.imgchest.com/files/d7be7615fcfb.png" alt="Yoga Fan Control GUI" width="600">
 </p>
 
 A standalone fan control utility for the **Lenovo Yoga Pro 9i Gen 9 (2024)** with a dark-themed GUI, live monitoring, and full manual override of the EC (Embedded Controller).
@@ -27,14 +31,11 @@ A standalone fan control utility for the **Lenovo Yoga Pro 9i Gen 9 (2024)** wit
 | **Live Monitoring** | Real-time arc gauges showing current fan speed |
 | **Presets** | Built-in presets (OFF / Min 18% / Med 22% / Med-High 30% / High 48%) |
 | **Custom Presets** | Create your own presets with validation and persistence. Use right-click to delete a custom preset|
-| **Hold Mode** | Re-sends fan speed every 3s to prevent EC override (not really necessary for work) |
 | **System Tray** | Minimizes to tray on close; quit only via right-click → Quit |
-| **Sleep Safe** | Automatically restores auto fan control before system sleep |
 | **Shutdown Safe** | Restores auto fan control on shutdown/restart |
 | **Standalone .exe** | Single executable - no Python installation required |
 | **Self-contained Driver** | Auto-installs WinRing0 driver |
 | **Easy Uninstall** | Includes script for driver uninstallation |
-
 
 ---
 
@@ -80,8 +81,7 @@ The tool enforces these ranges automatically. The 1–17% dead zone is a hardwar
 
 This tool is designed to **never leave your laptop in a dangerous state**:
 
-- **On Sleep** → Auto fan control is restored before the system suspends
-- **On Shutdown/Restart** → Auto fan control is restored before the system powers down
+- **On Shutdown/Restart** → Auto fan control is restored before the system powers down (if the program is running)
 - **On App Quit** → Auto fan control is restored when you exit via the tray
 
 ---
@@ -160,10 +160,6 @@ python fan_control.py auto
 
 # Monitor fan speeds in real-time
 python fan_control.py monitor
-
-# Hold fans at a specific speed (re-sends every 3s)
-python fan_control.py hold --fan1 25 --fan2 25
-```
 
 ---
 
