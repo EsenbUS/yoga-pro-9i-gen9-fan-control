@@ -27,7 +27,7 @@ import pystray
 
 # Add script directory to path so we can import fan_control
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fan_control import WinRing0, ECMailbox, is_admin
+from fan_control import FanController, is_admin
 
 try:
     import psutil
@@ -246,13 +246,10 @@ class FanControlApp:
         self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
 
         # State
-        self.ec = None
-        self.driver = None
+        self.backend = None
         self.connected = False
-        self.hold_active = False
         self.auto_mode = True
         self.running = True
-        self._hold_thread = None
         self._monitor_thread = None
         self._tray_icon = None
 
@@ -268,9 +265,21 @@ class FanControlApp:
         self._setup_tray()
         self._setup_power_events()
         self._setup_shutdown_handler()
-        self._ensure_startup_safety_task()
+        self._cleanup_legacy_task()
 
         atexit.register(self._safety_restore)
+
+    # ── Legacy Cleanup ────────────────────────────────────────────────────
+
+    def _cleanup_legacy_task(self):
+        """Remove the old FanControlAutoRestore scheduled task if it exists."""
+        try:
+            subprocess.run(
+                ['schtasks', '/delete', '/tn', 'FanControlAutoRestore', '/f'],
+                capture_output=True, text=True,
+            )
+        except Exception:
+            pass
 
     # ── Shutdown Detection ───────────────────────────────────────────────
 
@@ -307,18 +316,13 @@ class FanControlApp:
                 if msg in (WM_QUERYENDSESSION, WM_ENDSESSION):
                     # System is shutting down - restore auto fan control NOW
                     self.running = False
-                    self.hold_active = False
                     if self.connected:
                         try:
-                            self.ec.restore_auto()
+                            self.backend.restore_auto()
                         except Exception:
                             pass
                         try:
-                            self.driver.close()
-                        except Exception:
-                            pass
-                        try:
-                            self.driver.stop_driver()
+                            self.backend.close()
                         except Exception:
                             pass
                         self.connected = False
@@ -553,71 +557,38 @@ class FanControlApp:
             pass  # Best effort - sleep handling is a nice-to-have
 
     def _on_suspend(self):
-        """Called when system is about to sleep. Restore auto + stop driver."""
-        # Restore auto fan control first
+        """Called when system is about to sleep.
+
+        With the transient driver model, no driver is running at this point.
+        We just restore auto fan control as a best-effort safety measure.
+        The driver was already stopped+deleted after the last fan write.
+        """
         if self.connected:
             try:
-                self.ec.restore_auto()
+                self.backend.restore_auto()
             except Exception:
                 pass
-
-        # Close driver handle and stop the service
-        if self.driver:
-            try:
-                self.driver.close()
-            except Exception:
-                pass
-            try:
-                self.driver.stop_driver()
-            except Exception:
-                pass
+        # NOTE: backend.close() is a no-op with FanController (transient sessions)
+        # No service to stop — that already happened after the last write.
         self.connected = False
 
     def _on_resume(self):
-        """Called when system resumes from sleep. Restart driver."""
+        """Called when system resumes from sleep. Reconnect backend."""
         def _delayed_reconnect():
-            time.sleep(3)  # Give hardware time to settle
+            time.sleep(2)  # Give hardware time to settle
             self.root.after(0, self._connect)
         threading.Thread(target=_delayed_reconnect, daemon=True).start()
 
     # ── Boot Safety ───────────────────────────────────────────────────
 
     def _ensure_startup_safety_task(self):
-        """Install a Windows scheduled task to restore auto fan control on boot."""
-        TASK_NAME = "FanControlAutoRestore"
-        try:
-            # Check if task already exists
-            result = subprocess.run(
-                ['schtasks', '/query', '/tn', TASK_NAME],
-                capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                return  # Already installed
+        """No-op: not needed with the transient driver model.
 
-            # Get exe/script path for the task
-            if getattr(sys, 'frozen', False):
-                exe_path = sys.executable
-            else:
-                exe_path = sys.executable  # python.exe
-
-            if getattr(sys, 'frozen', False):
-                task_cmd = f'"{exe_path}" --startup-safety'
-            else:
-                script_path = os.path.abspath(__file__)
-                task_cmd = f'"{exe_path}" "{script_path}" --startup-safety'
-
-            # Create the scheduled task: runs at system startup as SYSTEM
-            subprocess.run([
-                'schtasks', '/create',
-                '/tn', TASK_NAME,
-                '/tr', task_cmd,
-                '/sc', 'onstart',        # Run at system boot
-                '/ru', 'SYSTEM',         # Run as SYSTEM (has admin rights)
-                '/rl', 'HIGHEST',        # Highest privileges
-                '/f',                    # Force (overwrite if exists)
-            ], capture_output=True, text=True)
-        except Exception:
-            pass  # Non-critical - best effort
+        Previously this installed a scheduled task to restore auto fan control
+        on boot. With transient WinRing0 sessions, the driver is never left
+        in an active state, so there's nothing to recover from on next boot.
+        """
+        pass
 
     # ── UI Construction ────────────────────────────────────────────────────
 
@@ -702,23 +673,12 @@ class FanControlApp:
         self.custom_presets = []  # list of {"name": str, "speed": int}
         self._rebuild_presets()
 
-        # ── Hold + Auto ──
+        # ── Auto ──
         bottom_card = tk.Frame(main, bg=COLORS["bg_panel"], padx=10, pady=10)
         bottom_card.pack(fill="x", pady=(0, 5))
 
         controls = tk.Frame(bottom_card, bg=COLORS["bg_panel"])
         controls.pack()
-
-        self.hold_var = tk.BooleanVar(value=False)
-        self.hold_cb = tk.Checkbutton(controls, text="🔄 Hold Mode",
-                                       variable=self.hold_var,
-                                       font=(FONT_FAMILY, 10),
-                                       fg=COLORS["text"], bg=COLORS["bg_panel"],
-                                       selectcolor=COLORS["bg_input"],
-                                       activebackground=COLORS["bg_panel"],
-                                       activeforeground=COLORS["text"],
-                                       command=self._toggle_hold)
-        self.hold_cb.pack(side="left", padx=(0, 20))
 
         self.auto_btn = tk.Button(controls, text="↺ Auto Mode",
                                    font=(FONT_FAMILY, 11, "bold"),
@@ -729,7 +689,7 @@ class FanControlApp:
                                    relief="flat", padx=20, pady=6,
                                    cursor="hand2",
                                    command=self._restore_auto)
-        self.auto_btn.pack(side="left")
+        self.auto_btn.pack()
         self.auto_btn.bind("<Enter>", lambda e: self.auto_btn.config(
             bg=COLORS["accent"]))
         self.auto_btn.bind("<Leave>", lambda e: self.auto_btn.config(
@@ -767,20 +727,12 @@ class FanControlApp:
 
     def _connect(self):
         try:
-            self.driver = WinRing0()
-            self.driver.open()
-            self.ec = ECMailbox(self.driver)
+            self.backend = FanController()
+            # FanController uses transient sessions — verify it works with a read
+            _ = self.backend.read_fan1()
             self.connected = True
             self._draw_status_dot(True)
-            self.status_label.config(text="Connected", fg=COLORS["success"])
-
-            # Safety: always restore auto mode on connect (protects against
-            # persisted fan speeds across reboots or crashes)
-            try:
-                self.ec.restore_auto()
-            except Exception:
-                pass
-
+            self.status_label.config(text="Connected (EC Mailbox)", fg=COLORS["success"])
             self._set_feedback("Ready. Use sliders or presets to control fan speed.")
         except Exception as e:
             self.connected = False
@@ -799,8 +751,7 @@ class FanControlApp:
         while self.running:
             if self.connected:
                 try:
-                    f1 = self.ec.read_fan1()
-                    f2 = self.ec.read_fan2()
+                    f1, f2 = self.backend.read_fans()
                     self.root.after(0, self.gauge1.set_value, f1)
                     self.root.after(0, self.gauge2.set_value, f2)
                 except Exception:
@@ -866,8 +817,8 @@ class FanControlApp:
 
         def _send():
             try:
-                ok1 = self.ec.set_fan1(f1)
-                ok2 = self.ec.set_fan2(f2)
+                ok1 = self.backend.set_fan1(f1)
+                ok2 = self.backend.set_fan2(f2)
                 if ok1 and ok2:
                     label = f"Set Fan 1: {f1}%, Fan 2: {f2}%"
                     color = COLORS["accent"]
@@ -1048,31 +999,6 @@ class FanControlApp:
         self.slider2.set_value(clamp_fan_speed(f2))
         self._apply_fan_speeds()
 
-    # ── Hold Mode ─────────────────────────────────────────────────────────
-
-    def _toggle_hold(self):
-        if self.hold_var.get():
-            self.hold_active = True
-            self.auto_mode = False
-            self._set_feedback("Hold mode ON - re-sending every 3s", COLORS["warning"])
-            self._hold_thread = threading.Thread(target=self._hold_loop, daemon=True)
-            self._hold_thread.start()
-        else:
-            self.hold_active = False
-            self._set_feedback("Hold mode OFF")
-
-    def _hold_loop(self):
-        while self.hold_active and self.running:
-            if self.connected:
-                f1 = self.slider1.get_value()
-                f2 = self.slider2.get_value()
-                try:
-                    self.ec.set_fan1(f1)
-                    self.ec.set_fan2(f2)
-                except Exception:
-                    pass
-            time.sleep(3)
-
     # ── Auto Mode ─────────────────────────────────────────────────────────
 
     def _restore_auto(self):
@@ -1081,14 +1007,12 @@ class FanControlApp:
             self._set_feedback("Not connected to EC", COLORS["danger"])
             return
 
-        self.hold_active = False
-        self.hold_var.set(False)
         self.auto_mode = True
-        _above_safe_confirmed = False  # Reset confirmation for next time
+        _above_safe_confirmed = False
 
         def _send():
             try:
-                ok = self.ec.restore_auto()
+                ok = self.backend.restore_auto()
                 if ok:
                     self.root.after(0, self._set_feedback,
                                     "Automatic fan control restored", COLORS["success"])
@@ -1136,14 +1060,13 @@ class FanControlApp:
         # Always restore - don't check auto_mode flag, this is a safety net
         if self.connected:
             try:
-                self.ec.restore_auto()
+                self.backend.restore_auto()
             except Exception:
                 pass
 
     def _on_close(self):
         """Full shutdown - called from tray Quit."""
         self.running = False
-        self.hold_active = False
         self._save_config()
 
         # Stop tray icon
@@ -1156,17 +1079,13 @@ class FanControlApp:
         # Restore auto if we changed anything
         if self.connected and not self.auto_mode:
             try:
-                self.ec.restore_auto()
+                self.backend.restore_auto()
             except Exception:
                 pass
 
-        if self.driver:
+        if self.backend:
             try:
-                self.driver.close()
-            except Exception:
-                pass
-            try:
-                self.driver.stop_driver()
+                self.backend.close()
             except Exception:
                 pass
 
@@ -1193,12 +1112,8 @@ class FanControlApp:
 def _run_startup_safety():
     """Headless mode: restore EC auto fan control and exit silently."""
     try:
-        driver = WinRing0()
-        driver.open()
-        ec = ECMailbox(driver)
-        ec.restore_auto()
-        driver.close()
-        driver.stop_driver()
+        fc = FanController()
+        fc.restore_auto()
     except Exception:
         pass
     sys.exit(0)
