@@ -252,6 +252,8 @@ class FanControlApp:
         self.running = True
         self._monitor_thread = None
         self._tray_icon = None
+        self._visible_event = threading.Event()
+        self._visible_event.set()  # starts visible
 
         # Generate and set app icon
         self._app_icon = self._create_fan_icon(256)
@@ -484,6 +486,7 @@ class FanControlApp:
             # System is shutting down - do a real close with auto-restore
             self._on_close()
             return
+        self._visible_event.clear()
         self.root.withdraw()
 
     def _show_from_tray(self, icon=None, item=None):
@@ -492,6 +495,7 @@ class FanControlApp:
 
     def _restore_window(self):
         """Restore and focus the window."""
+        self._visible_event.set()
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -749,6 +753,11 @@ class FanControlApp:
 
     def _monitor_loop(self):
         while self.running:
+            # Block until the window is visible (uses zero CPU while waiting)
+            self._visible_event.wait()
+            if not self.running:
+                break
+
             if self.connected:
                 try:
                     f1, f2 = self.backend.read_fans()
