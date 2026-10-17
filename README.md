@@ -1,7 +1,3 @@
-> For safety's sake before using this program update BIOS to the latest (NKCN32WW) using this website [Lenovo Drivers](https://pcsupport.lenovo.com/us/en/products/laptops-and-netbooks/yoga-series/yoga-pro-9-16imh9/83dn/83dn0008us/pf4zs51d/downloads/driver-list)
-
-
-
 # Fan Control - Lenovo Yoga Pro 9i Gen 9
 
 <p align="center">
@@ -38,7 +34,7 @@ A standalone fan control utility for the **Lenovo Yoga Pro 9i Gen 9 (2024)** wit
 
 ### Option 1: Pre-built Executable (Recommended)
 
-1. Download `Yoga Fan Control.exe` and run
+1. Download `Fan.Control.exe` from [Releases](https://github.com/EsenbUS/yoga-pro-9i-gen9-fan-control/releases) and run
 2. Accept the UAC (Administrator)
 3. Control your fans
 
@@ -120,7 +116,7 @@ pyinstaller --onefile --noconsole --uac-admin \
   fan_control_gui.py
 ```
 
-The output will be in `dist/Yoga Fan Control.exe`.
+The output will be in `dist/Fan Control.exe`.
 
 ---
 
