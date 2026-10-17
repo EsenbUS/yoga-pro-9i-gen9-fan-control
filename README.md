@@ -1,8 +1,3 @@
-> **Project uses WinRing0, so you are required to exclude it from Windows Defender/whatever antivirus you use if you want to use this program. 
-See [Microsoft Article](https://support.microsoft.com/en-us/windows/microsoft-defender-antivirus-alert-vulnerabledriver-winnt-winring0-eb057830-d77b-41a2-9a34-015a5d203c42)**
-
-> **Although the program uses WinRing0, here it is implemented as a temporary driver: it installs the driver, uses it, and then uninstalls its service immediately after every read. This way 99.97% of the time driver is not available to any malicious software. The remaining ~0.03% of the time (50ms window every 1.5s during monitoring; only when the program is in the foreground): a race condition is theoretically possible - a malicious process polling for the device could catch the window and open a handle before deletion. In practice this race window is so narrow and so unpredictable that realistic exploitation is essentially impossible - an attacker would need to win a 50ms race against an unpredictable timer with no scheduling guarantees.**
-
 > For safety's sake before using this program update BIOS to the latest (NKCN32WW) using this website [Lenovo Drivers](https://pcsupport.lenovo.com/us/en/products/laptops-and-netbooks/yoga-series/yoga-pro-9-16imh9/83dn/83dn0008us/pf4zs51d/downloads/driver-list)
 
 
@@ -15,7 +10,7 @@ See [Microsoft Article](https://support.microsoft.com/en-us/windows/microsoft-de
 
 A standalone fan control utility for the **Lenovo Yoga Pro 9i Gen 9 (2024)** with a dark-themed GUI, live monitoring, and full manual override of the EC (Embedded Controller).
 
-> **No third-party services required** - this tool communicates directly with the EC via the mailbox protocol on I/O ports `0x5C0`/`0x5C4`, using the WinRing0 kernel driver for privileged I/O access.
+> **No drivers, no third-party services** - this tool calls the fan-control method that Lenovo's own firmware exposes through WMI (`root\WMI` → `LENOVO_OTHER_METHOD`). The firmware does the EC access itself, with proper locking.
 
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6?logo=windows)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
@@ -34,8 +29,8 @@ A standalone fan control utility for the **Lenovo Yoga Pro 9i Gen 9 (2024)** wit
 | **System Tray** | Minimizes to tray on close; quit only via right-click → Quit |
 | **Shutdown Safe** | Restores auto fan control on shutdown/restart |
 | **Standalone .exe** | Single executable - no Python installation required |
-| **Self-contained Driver** | Auto-installs WinRing0 driver |
-| **Easy Uninstall** | Includes script for driver uninstallation |
+| **No Kernel Driver** | Uses the firmware's WMI interface; no WinRing0, no antivirus exclusions |
+| **Sleep Safe** | Stops all EC access while the display is off or the system is sleeping |
 
 ---
 
@@ -54,13 +49,13 @@ A standalone fan control utility for the **Lenovo Yoga Pro 9i Gen 9 (2024)** wit
 git clone https://github.com/EsenbUS/yoga-pro-9i-gen9-fan-control.git
 
 # Install dependencies
-pip install psutil Pillow pystray
+pip install psutil Pillow pystray pywin32
 
 # Run as Administrator
 python fan_control_gui.py
 ```
 
-> **Must be run as Administrator** - privileged I/O port access requires elevation.
+> **Must be run as Administrator** - Lenovo's WMI fan interface denies access to non-admin processes.
 
 ---
 
@@ -83,34 +78,20 @@ This tool is designed to **never leave your laptop in a dangerous state**:
 
 - **On Shutdown/Restart** → Auto fan control is restored before the system powers down (if the program is running)
 - **On App Quit** → Auto fan control is restored when you exit via the tray
+- **On Display Off / Sleep** → Auto fan control is restored when the display turns off, and the EC is not touched again until the display has been back on for 5 seconds. Your manual speeds are then re-applied. This keeps the app out of the way of Modern Standby and hibernate transitions.
 
 ---
 
 ## How It Works
 
-The tool communicates with the laptop's Embedded Controller using the **EC Mailbox Protocol**, reverse-engineered from the DSDT (ACPI firmware tables):
+The firmware exposes a WMI method (`LENOVO_OTHER_METHOD`, ACPI `\_SB.GZFD.WMAE`) that Lenovo's own software uses. Internally it runs the **EC Mailbox Protocol** on ports `0x5C0`/`0x5C4` while holding the EC mutex and the ACPI Global Lock, so calls can't collide with other EC traffic.
 
-```
-Port 0x5C0 - Data register (read/write)
-Port 0x5C4 - Command/status register
-```
+| Feature ID | `GetFeatureValue` | `SetFeatureValue` |
+|------------|-------------------|-------------------|
+| `0x04030001` | Fan 1 speed × 100 | `0` = auto, `1` = off, `N` = `N / 100` % |
+| `0x04030002` | Fan 2 speed × 100 | same as Fan 1 |
 
-**Protocol sequence:**
-1. Wait for Input Buffer Empty (IBE) on `0x5C4`
-2. Wait for Output Buffer Empty (OBE) on `0x5C4`
-3. Write command byte to `0x5C4`
-4. Write sub-command to `0x5C0`
-5. Write data to `0x5C0`
-6. Wait for Output Buffer Full (OBF) on `0x5C4`
-7. Read result from `0x5C0`
-
-| Command | Sub-cmd | Description |
-|---------|---------|-------------|
-| `0xD0` | `0x61` | Set Fan 1 speed (0–255) |
-| `0xD0` | `0x62` | Set Fan 2 speed (0–255) |
-| `0xD0` | `0x21` | Read Fan 1 speed |
-| `0xD0` | `0x22` | Read Fan 2 speed |
-| `0xD1` | `0x61` / `0x62` | Restore auto control |
+Earlier versions wrote to the mailbox ports directly through the WinRing0 driver. That bypassed the firmware's locking and could leave the EC mid-command around sleep transitions, which caused failed hibernates and full battery drains. The app removes the leftover `WinRing0_Transient` service and driver copy on startup.
 
 ---
 
@@ -118,9 +99,8 @@ Port 0x5C4 - Command/status register
 
 ```
 Fan_control/
-├── fan_control.py          # Backend: EC mailbox protocol + WinRing0 driver management
+├── fan_control.py          # Backend: Lenovo WMI fan interface + CLI
 ├── fan_control_gui.py      # Frontend: Tkinter GUI with tray, presets, gauges
-├── WinRing0x64.sys         # Kernel driver for I/O port access (required)
 ├── fan_config.json         # User settings (auto-generated, not committed)
 └── README.md
 ```
@@ -130,12 +110,12 @@ Fan_control/
 ## Building the Standalone Executable
 
 ```bash
-pip install pyinstaller Pillow pystray psutil
+pip install pyinstaller Pillow pystray psutil pywin32
 
 pyinstaller --onefile --noconsole --uac-admin \
   --name "Fan Control" \
   --icon "fan_control.ico" \ # Optional
-  --add-data "WinRing0x64.sys;." \
+\
   --add-data "fan_control.py;." \
   fan_control_gui.py
 ```

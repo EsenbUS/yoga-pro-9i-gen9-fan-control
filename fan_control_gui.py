@@ -2,7 +2,7 @@
 """
 Fan Control GUI - Lenovo Yoga Pro 9i Gen 9 (2024)
 
-A dark-themed tkinter GUI for controlling fan speed via the EC mailbox.
+A dark-themed tkinter GUI for controlling fan speed via Lenovo's firmware WMI interface.
 Uses fan_control.py as the backend.
 
 MUST BE RUN AS ADMINISTRATOR.
@@ -27,7 +27,7 @@ import pystray
 
 # Add script directory to path so we can import fan_control
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fan_control import FanController, is_admin
+from fan_control import FanController, FanControlPaused, is_admin, cleanup_legacy_driver
 
 try:
     import psutil
@@ -73,6 +73,7 @@ CONFIG_FILE = os.path.join(_app_dir, "fan_config.json")
 # Safety limits
 MIN_FAN_SPEED = 18   # Values 1-17 cause pulsing; 0 (off) is fine
 SAFE_MAX = 48        # EC's normal maximum; above this requires confirmation
+RESUME_SETTLE = 5.0  # seconds the display must stay on before EC access resumes
 _above_safe_confirmed = False  # User has acknowledged going above SAFE_MAX
 
 def clamp_fan_speed(val):
@@ -255,6 +256,14 @@ class FanControlApp:
         self._visible_event = threading.Event()
         self._visible_event.set()  # starts visible
 
+        # Sleep / display handling (see _setup_power_events)
+        self._power_lock = threading.Lock()
+        self._quiet = False          # True = no EC access allowed
+        self._display_on = True
+        self._wake_timer = None
+        self._applied_speeds = None  # last manual (f1, f2) sent to the EC
+        self._resume_speeds = None   # manual speeds to re-apply after sleep
+
         # Generate and set app icon
         self._app_icon = self._create_fan_icon(256)
         self._tray_icon_image = self._create_fan_icon(64)
@@ -274,14 +283,16 @@ class FanControlApp:
     # ── Legacy Cleanup ────────────────────────────────────────────────────
 
     def _cleanup_legacy_task(self):
-        """Remove the old FanControlAutoRestore scheduled task if it exists."""
+        """Remove the old scheduled task and WinRing0 driver if they exist."""
         try:
             subprocess.run(
                 ['schtasks', '/delete', '/tn', 'FanControlAutoRestore', '/f'],
                 capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
         except Exception:
             pass
+        cleanup_legacy_driver()
 
     # ── Shutdown Detection ───────────────────────────────────────────────
 
@@ -507,7 +518,15 @@ class FanControlApp:
     # ── Power Event Handling (Sleep/Resume) ──────────────────────────────
 
     def _setup_power_events(self):
-        """Register for power suspend/resume via powrprof callback (no window needed)."""
+        """Register for suspend/resume and display on/off via powrprof callbacks.
+
+        EC access is only allowed while the display is on. Turning the display
+        off is the first step of Modern Standby, and the system is still fully
+        awake at that point, so that is where auto fan control gets restored.
+        From then until the display has been back on for RESUME_SETTLE seconds,
+        nothing touches the EC — in particular not during standby, the brief
+        wake before hibernate, or the hibernate transition itself.
+        """
         try:
             powrprof = ctypes.windll.powrprof
 
@@ -515,7 +534,7 @@ class FanControlApp:
             DEVICE_NOTIFY_CALLBACK_ROUTINE = ctypes.CFUNCTYPE(
                 wintypes.ULONG,     # return
                 ctypes.c_void_p,    # Context
-                wintypes.ULONG,     # Type (PBT_APM* values)
+                wintypes.ULONG,     # Type (PBT_* values)
                 ctypes.c_void_p,    # Setting
             )
 
@@ -525,8 +544,30 @@ class FanControlApp:
                     ("Context", ctypes.c_void_p),
                 ]
 
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            class POWERBROADCAST_SETTING(ctypes.Structure):
+                _fields_ = [
+                    ("PowerSetting", GUID),
+                    ("DataLength", wintypes.DWORD),
+                    ("Data", wintypes.DWORD),
+                ]
+
             powrprof.PowerRegisterSuspendResumeNotification.restype = wintypes.DWORD
             powrprof.PowerRegisterSuspendResumeNotification.argtypes = [
+                wintypes.DWORD,
+                ctypes.POINTER(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS),
+                ctypes.POINTER(wintypes.HANDLE),
+            ]
+            powrprof.PowerSettingRegisterNotification.restype = wintypes.DWORD
+            powrprof.PowerSettingRegisterNotification.argtypes = [
+                ctypes.POINTER(GUID),
                 wintypes.DWORD,
                 ctypes.POINTER(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS),
                 ctypes.POINTER(wintypes.HANDLE),
@@ -535,13 +576,23 @@ class FanControlApp:
             PBT_APMSUSPEND = 0x0004
             PBT_APMRESUMESUSPEND = 0x0007
             PBT_APMRESUMEAUTOMATIC = 0x0012
+            PBT_POWERSETTINGCHANGE = 0x8013
             DEVICE_NOTIFY_CALLBACK = 2
+
+            # GUID_CONSOLE_DISPLAY_STATE {6FE69556-704A-47A0-8F24-C28D936FDA47}
+            display_guid = GUID(0x6FE69556, 0x704A, 0x47A0,
+                                (ctypes.c_ubyte * 8)(0x8F, 0x24, 0xC2, 0x8D,
+                                                     0x93, 0x6F, 0xDA, 0x47))
 
             def power_callback(context, event_type, setting):
                 if event_type == PBT_APMSUSPEND:
                     self._on_suspend()
                 elif event_type in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
                     self._on_resume()
+                elif event_type == PBT_POWERSETTINGCHANGE and setting:
+                    pbs = ctypes.cast(setting, ctypes.POINTER(POWERBROADCAST_SETTING)).contents
+                    # 0 = off, 1 = on, 2 = dimmed (still on)
+                    self._on_display_state(pbs.Data != 0)
                 return 0
 
             # Must keep references to prevent garbage collection
@@ -549,50 +600,96 @@ class FanControlApp:
             self._power_params = DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS()
             self._power_params.Callback = self._power_callback_func
             self._power_params.Context = None
+            self._display_guid = display_guid
             self._power_reg_handle = wintypes.HANDLE()
+            self._display_reg_handle = wintypes.HANDLE()
 
-            result = powrprof.PowerRegisterSuspendResumeNotification(
+            powrprof.PowerRegisterSuspendResumeNotification(
                 DEVICE_NOTIFY_CALLBACK,
                 ctypes.byref(self._power_params),
                 ctypes.byref(self._power_reg_handle),
             )
-            # result == 0 means success (ERROR_SUCCESS)
+            # Windows immediately reports the current display state on registration
+            powrprof.PowerSettingRegisterNotification(
+                ctypes.byref(self._display_guid),
+                DEVICE_NOTIFY_CALLBACK,
+                ctypes.byref(self._power_params),
+                ctypes.byref(self._display_reg_handle),
+            )
         except Exception:
             pass  # Best effort - sleep handling is a nice-to-have
 
-    def _on_suspend(self):
-        """Called when system is about to sleep.
+    def _on_display_state(self, on):
+        """Display turned on/off (runs on a system thread)."""
+        with self._power_lock:
+            self._display_on = on
+        if on:
+            self._schedule_wake()
+        else:
+            self._enter_quiet(restore=True)
 
-        With the transient driver model, no driver is running at this point.
-        We just restore auto fan control as a best-effort safety measure.
-        The driver was already stopped+deleted after the last fan write.
-        """
-        if self.connected:
-            try:
-                self.backend.restore_auto()
-            except Exception:
-                pass
-        # NOTE: backend.close() is a no-op with FanController (transient sessions)
-        # No service to stop — that already happened after the last write.
-        self.connected = False
+    def _on_suspend(self):
+        """System is suspending. Block EC access, but don't touch the EC
+        mid-transition — auto mode was already restored at display-off."""
+        self._enter_quiet(restore=False)
 
     def _on_resume(self):
-        """Called when system resumes from sleep. Reconnect backend."""
-        def _delayed_reconnect():
-            time.sleep(2)  # Give hardware time to settle
-            self.root.after(0, self._connect)
-        threading.Thread(target=_delayed_reconnect, daemon=True).start()
+        """System resumed. Only leave quiet mode if the display is actually on;
+        the short wake before hibernate keeps the display off."""
+        with self._power_lock:
+            display_on = self._display_on
+        if display_on:
+            self._schedule_wake()
 
-    # ── Boot Safety ───────────────────────────────────────────────────
+    def _enter_quiet(self, restore):
+        """Stop all EC access; optionally restore auto fan control first."""
+        with self._power_lock:
+            if self._wake_timer:
+                self._wake_timer.cancel()
+                self._wake_timer = None
+            if self._quiet:
+                return
+            self._quiet = True
 
-    def _ensure_startup_safety_task(self):
-        """No-op: not needed with the transient driver model.
+            if self.backend and self.connected:
+                if restore and not self.auto_mode:
+                    try:
+                        self.backend.restore_auto()
+                        self._resume_speeds = self._applied_speeds
+                        self.auto_mode = True
+                    except Exception:
+                        pass
+                self.backend.pause()
 
-        Previously this installed a scheduled task to restore auto fan control
-        on boot. With transient WinRing0 sessions, the driver is never left
-        in an active state, so there's nothing to recover from on next boot.
-        """
-        pass
+    def _schedule_wake(self):
+        """Leave quiet mode once the display has stayed on for a while."""
+        with self._power_lock:
+            if not self._quiet or self._wake_timer:
+                return
+            self._wake_timer = threading.Timer(RESUME_SETTLE, self._leave_quiet)
+            self._wake_timer.daemon = True
+            self._wake_timer.start()
+
+    def _leave_quiet(self):
+        with self._power_lock:
+            self._wake_timer = None
+            if not self._quiet or not self._display_on:
+                return
+            self._quiet = False
+            speeds, self._resume_speeds = self._resume_speeds, None
+            if self.backend:
+                self.backend.unpause()
+
+        if speeds and self.connected:
+            # Re-apply the manual speeds that were active before the display went off
+            try:
+                self.backend.set_fans(*speeds)
+                self.auto_mode = False
+                self.root.after(0, self._set_feedback,
+                                f"Re-applied Fan 1: {speeds[0]}%, Fan 2: {speeds[1]}% after sleep",
+                                COLORS["accent"])
+            except Exception as e:
+                self.root.after(0, self._set_feedback, f"Error: {e}", COLORS["danger"])
 
     # ── UI Construction ────────────────────────────────────────────────────
 
@@ -731,12 +828,12 @@ class FanControlApp:
 
     def _connect(self):
         try:
-            self.backend = FanController()
-            # FanController uses transient sessions — verify it works with a read
+            if self.backend is None:
+                self.backend = FanController()
             _ = self.backend.read_fan1()
             self.connected = True
             self._draw_status_dot(True)
-            self.status_label.config(text="Connected (EC Mailbox)", fg=COLORS["success"])
+            self.status_label.config(text="Connected (Lenovo WMI)", fg=COLORS["success"])
             self._set_feedback("Ready. Use sliders or presets to control fan speed.")
         except Exception as e:
             self.connected = False
@@ -758,7 +855,7 @@ class FanControlApp:
             if not self.running:
                 break
 
-            if self.connected:
+            if self.connected and not self._quiet:
                 try:
                     f1, f2 = self.backend.read_fans()
                     self.root.after(0, self.gauge1.set_value, f1)
@@ -800,6 +897,10 @@ class FanControlApp:
             self._set_feedback("Not connected to EC", COLORS["danger"])
             return
 
+        if self._quiet:
+            self._set_feedback("Paused while the display is off / sleeping", COLORS["warning"])
+            return
+
         f1 = self.slider1.get_value()
         f2 = self.slider2.get_value()
 
@@ -823,11 +924,11 @@ class FanControlApp:
             _above_safe_confirmed = True
 
         self.auto_mode = False
+        self._applied_speeds = (f1, f2)
 
         def _send():
             try:
-                ok1 = self.backend.set_fan1(f1)
-                ok2 = self.backend.set_fan2(f2)
+                ok1, ok2 = self.backend.set_fans(f1, f2)
                 if ok1 and ok2:
                     label = f"Set Fan 1: {f1}%, Fan 2: {f2}%"
                     color = COLORS["accent"]
@@ -838,6 +939,9 @@ class FanControlApp:
                 else:
                     self.root.after(0, self._set_feedback,
                                     "Warning: EC did not confirm", COLORS["warning"])
+            except FanControlPaused:
+                self.root.after(0, self._set_feedback,
+                                "Paused while the display is off / sleeping", COLORS["warning"])
             except Exception as e:
                 self.root.after(0, self._set_feedback, f"Error: {e}", COLORS["danger"])
 
@@ -1017,6 +1121,7 @@ class FanControlApp:
             return
 
         self.auto_mode = True
+        self._applied_speeds = None
         _above_safe_confirmed = False
 
         def _send():
